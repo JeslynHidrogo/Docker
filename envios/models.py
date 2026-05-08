@@ -2,11 +2,14 @@ from django.db import models
 from config.choices import EstadoGeneral, EstadoEnvio
 from clientes.models import Cliente
 from rutas.models import Ruta
-# Nuevas importaciones de validadores (Pág. 42-43)
 from .validators import validar_peso_positivo, validar_codigo_encomienda
 from django.core.validators import MinValueValidator
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+from .querysets import EncomiendaQuerySet
+
+# Si ya tienes querysets.py (Pág. 63), descomenta esta línea:
+# from .querysets import EncomiendaQuerySet
 
 class Empleado(models.Model):
     codigo = models.CharField(max_length=10, unique=True)
@@ -31,7 +34,11 @@ class Empleado(models.Model):
         ordering = ['apellidos']
 
 class Encomienda(models.Model):
-    # ── Identificación con VALIDATORS (Pág. 42) ──────────
+    objects = EncomiendaQuerySet.as_manager()
+    # Si ya tienes querysets.py (Pág. 63), descomenta esta línea para activar el Manager:
+    # objects = EncomiendaQuerySet.as_manager()
+
+    # ── Identificación con VALIDATORS ──────────
     codigo = models.CharField(
         max_length=20, 
         unique=True,
@@ -73,43 +80,27 @@ class Encomienda(models.Model):
     def __str__(self):
         return f'{self.codigo} [{self.get_estado_display()}]'
     
-    # --- Métodos de Validación (Pág. 43-45) ---
+    # --- Métodos de Validación ---
 
     def clean(self):
-        """
-        Validaciones personalizadas que involucran múltiples campos.
-        """
         errors = {}
-
-        # 1. Validar que el remitente y destinatario no sean la misma persona (Pág. 43)
         if self.remitente_id and self.destinatario_id:
             if self.remitente_id == self.destinatario_id:
-                errors['destinatario'] = ValidationError(
-                    'El destinatario no puede ser el mismo que el remitente.'
-                )
+                errors['destinatario'] = ValidationError('El destinatario no puede ser el mismo que el remitente.')
 
-        # 2. Validar que la fecha estimada no sea en el pasado (Pág. 44)
         if self.fecha_entrega_est:
             if self.fecha_entrega_est < timezone.now().date():
-                errors['fecha_entrega_est'] = ValidationError(
-                    'La fecha de entrega estimada no puede ser en el pasado.'
-                )
+                errors['fecha_entrega_est'] = ValidationError('La fecha de entrega estimada no puede ser en el pasado.')
 
-        # 3. Validar coherencia de fechas: real no puede ser antes que la estimada (Pág. 44)
         if self.fecha_entrega_est and self.fecha_entrega_real:
             if self.fecha_entrega_real < self.fecha_entrega_est:
-                errors['fecha_entrega_real'] = ValidationError(
-                    'La fecha de entrega real no puede ser antes de la fecha estimada.'
-                )
+                errors['fecha_entrega_real'] = ValidationError('La fecha de entrega real no puede ser antes de la estimada.')
 
         if errors:
             raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
-        """
-        Sobrescribimos el método save para forzar la validación completa (Pág. 45).
-        """
-        self.full_clean()  # Esto llama a los validators de los campos y al método clean()
+        self.full_clean()
         super().save(*args, **kwargs)
 
     class Meta:
@@ -117,6 +108,98 @@ class Encomienda(models.Model):
         verbose_name = 'Encomienda'
         verbose_name_plural = 'Encomiendas'
         ordering = ['-fecha_registro']
+
+    # --- Propiedades ---
+
+    @property
+    def esta_entregada(self):
+        return self.estado == EstadoEnvio.ENTREGADO 
+
+    @property
+    def esta_en_transito(self):
+        return self.estado == EstadoEnvio.EN_TRANSITO 
+
+    @property
+    def tiene_retraso(self):
+        if not self.fecha_entrega_est or self.esta_entregada:
+            return False
+        return timezone.now().date() > self.fecha_entrega_est
+
+    @property
+    def dias_en_transito(self):
+        if not self.fecha_registro: return 0
+        delta = timezone.now().date() - self.fecha_registro.date()
+        return delta.days 
+
+    @property
+    def descripcion_corta(self):
+        """Primeros 50 caracteres de la descripción [cite: 1086-1088]"""
+        return self.descripcion[:50] + '...' if len(self.descripcion) > 50 else self.descripcion 
+
+    # --- Métodos de Instancia ---
+
+    def calcular_costo(self):
+        """Calcula el costo del envio basándose en el precio base de la ruta y el peso del paquete [cite: 1121-1123]."""
+        PRECIO_POR_KG_EXTRA = 2.50
+        PESO_BASE = 5.0
+        
+        costo = float(self.ruta.precio_base)
+        
+        if float(self.peso_kg) > PESO_BASE:
+            extra = float(self.peso_kg) - PESO_BASE
+            costo += (extra * PRECIO_POR_KG_EXTRA)
+            
+        return round(costo, 2) 
+
+    def cambiar_estado(self, nuevo_estado, empleado, observacion=''):
+        if nuevo_estado == self.estado:
+            raise ValueError(f'La encomienda ya se encuentra en estado {self.get_estado_display()}') 
+
+        estado_anterior = self.estado
+        self.estado = nuevo_estado
+        
+        if nuevo_estado == EstadoEnvio.ENTREGADO:
+            self.fecha_entrega_real = timezone.now().date() 
+            
+        self.save()
+
+        HistorialEstado.objects.create(
+            encomienda=self,
+            estado_anterior=estado_anterior,
+            estado_nuevo=nuevo_estado,
+            empleado=empleado,
+            observacion=observacion
+        ) 
+        return self 
+
+    # --- Métodos de Clase ---
+
+    @classmethod
+    def crear_con_costo_calculado(cls, remitente, destinatario, ruta, 
+                                  empleado, descripcion, peso_kg, **kwargs):
+        import uuid
+        from django.utils import timezone
+        from datetime import timedelta
+
+        codigo = f'ENC-{timezone.now().strftime("%Y%m%d")}-{str(uuid.uuid4())[:6].upper()}' 
+        fecha_est = timezone.now().date() + timedelta(days=ruta.dias_entrega) 
+
+        encomienda = cls(
+            codigo=codigo,
+            descripcion=descripcion,
+            peso_kg=peso_kg,
+            remitente=remitente,
+            destinatario=destinatario,
+            ruta=ruta,
+            empleado_registro=empleado,
+            fecha_entrega_est=fecha_est,
+            costo_envio=0, 
+            **kwargs
+        ) 
+        
+        encomienda.costo_envio = encomienda.calcular_costo() 
+        encomienda.save() 
+        return encomienda 
 
 class HistorialEstado(models.Model):
     encomienda = models.ForeignKey(Encomienda, on_delete=models.CASCADE, related_name='historial')
